@@ -2,15 +2,17 @@ package main
 
 import (
 	"fmt"
-	"github.com/FedeBP/js2go/internal/generator"
-	"github.com/FedeBP/js2go/internal/parser"
 	"log"
 	"os"
 	"reflect"
+
+	"github.com/FedeBP/js2go/internal/generator"
+	"github.com/FedeBP/js2go/internal/parser"
+	"github.com/FedeBP/js2go/internal/transformer"
 )
 
 func main() {
-	// Read the simple.js file
+	// Read the JavaScript file
 	jsCode, err := os.ReadFile("examples/simple.js")
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
@@ -20,23 +22,22 @@ func main() {
 	p := parser.New(parser.NewLexer(string(jsCode)))
 	jsAst := p.ParseProgram()
 
+	// Transform the JavaScript AST to a Go AST
+	goAst, err := transformer.Transform(jsAst)
+	if err != nil {
+		log.Fatalf("Error transforming AST: %v", err)
+	}
+
 	// Create a new generator
 	newGenerator := generator.NewGenerator()
 
-	// Generate Go AST
-	goAst, err := newGenerator.GenerateGoAST(jsAst)
-	if err != nil {
-		log.Fatalf("Error generating Go AST: %v", err)
-	}
-
-	// Generate Go code
+	// Generate Go code from the Go AST
 	goCode, err := newGenerator.GenerateGoCode(goAst)
 	if err != nil {
 		log.Fatalf("Error generating Go code: %v", err)
 	}
 
-	// Print the generated Go code
-	fmt.Println("Generated Go code:")
+	// Print or save the generated Go code
 	fmt.Println(goCode)
 }
 

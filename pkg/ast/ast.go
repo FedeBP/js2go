@@ -298,3 +298,13 @@ type JSSpreadElement struct {
 
 func (se *JSSpreadElement) expressionNode()      {}
 func (se *JSSpreadElement) TokenLiteral() string { return "..." }
+
+type JSForInOfStatement struct {
+	Left  Node // Can be a VariableDeclaration or an Expression
+	Right Expression
+	Body  *BlockStatement
+	Type  string // "ForInStatement" or "ForOfStatement"
+}
+
+func (s *JSForInOfStatement) statementNode()       {}
+func (s *JSForInOfStatement) TokenLiteral() string { return "for" }

@@ -8,6 +8,13 @@ import (
 	"go/token"
 )
 
+type MultiDeclNode struct {
+	Decls []goast.Decl
+}
+
+func (n *MultiDeclNode) Pos() token.Pos { return token.NoPos }
+func (n *MultiDeclNode) End() token.Pos { return token.NoPos }
+
 func Transform(jsAST *ast.Program) (*goast.File, error) {
 	goFile := &goast.File{
 		Name: &goast.Ident{Name: "main"},
@@ -27,6 +34,10 @@ func Transform(jsAST *ast.Program) (*goast.File, error) {
 				Type: &goast.FuncType{},
 				Body: &goast.BlockStmt{List: []goast.Stmt{node}},
 			})
+		case *MultiDeclNode:
+			goFile.Decls = append(goFile.Decls, node.Decls...)
+		default:
+			return nil, fmt.Errorf("unexpected node type: %T", goNode)
 		}
 	}
 
@@ -58,7 +69,13 @@ func transformNode(node ast.Node) (goast.Node, error) {
 	case *ast.JSTryStatement:
 		return transformTryStatement(n)
 	case *ast.JSClassDeclaration:
-		return transformClassDeclaration(n)
+		decls, err := transformClassDeclaration(n)
+		if err != nil {
+			return nil, err
+		}
+		// Since we can't return []goast.Decl directly as goast.Node,
+		// we'll wrap it in a custom node type
+		return &MultiDeclNode{Decls: decls}, nil
 	case *ast.ExpressionStatement:
 		return transformExpressionStatement(n)
 	default:
@@ -74,6 +91,8 @@ func transformStatement(stmt ast.Statement) (goast.Stmt, error) {
 		return transformIfStatement(s)
 	case *ast.JSForStatement:
 		return transformForStatement(s)
+	case *ast.JSForInOfStatement:
+		return transformForInOfStatement(s)
 	case *ast.JSWhileStatement:
 		return transformWhileStatement(s)
 	case *ast.JSDoWhileStatement:
@@ -152,24 +171,22 @@ func transformVariableDeclaration(decl *ast.JSVariableDeclaration) (goast.Decl, 
 	for _, d := range decl.Declarations {
 		valueExpr, err := transformExpression(d.Init)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to transform variable declaration: %w", err)
 		}
 
 		var spec goast.Spec
 		switch decl.Kind {
 		case "const":
-			// For const, we use a constant declaration
 			spec = &goast.ValueSpec{
 				Names:  []*goast.Ident{goast.NewIdent(d.ID.Name)},
 				Values: []goast.Expr{valueExpr},
 				Type:   inferTypeFromExpression(valueExpr),
 			}
 		case "let", "var":
-			// For let and var, we use a variable declaration
-			// In Go, we don't distinguish between let and var
 			spec = &goast.ValueSpec{
 				Names:  []*goast.Ident{goast.NewIdent(d.ID.Name)},
 				Values: []goast.Expr{valueExpr},
+				Type:   inferTypeFromExpression(valueExpr),
 			}
 		default:
 			return nil, fmt.Errorf("unknown variable declaration kind: %s", decl.Kind)
@@ -201,15 +218,28 @@ func inferTypeFromExpression(expr goast.Expr) goast.Expr {
 			return goast.NewIdent("float64")
 		case token.STRING:
 			return goast.NewIdent("string")
+		case token.CHAR:
+			return goast.NewIdent("rune")
 		default:
-			panic("unhandled default case")
+			panic(fmt.Sprintf("unhandled basic literal: %v", e.Kind))
 		}
+	case *goast.CompositeLit:
+		if arrayType, ok := e.Type.(*goast.ArrayType); ok {
+			return arrayType
+		}
+		if mapType, ok := e.Type.(*goast.MapType); ok {
+			return mapType
+		}
+	case *goast.FuncLit:
+		return e.Type
 	case *goast.Ident:
 		if e.Name == "true" || e.Name == "false" {
 			return goast.NewIdent("bool")
 		}
+		if e.Name == "nil" {
+			return goast.NewIdent("interface{}")
+		}
 	}
-	// Default to interface{} for complex or unknown types
 	return goast.NewIdent("interface{}")
 }
 
@@ -224,18 +254,73 @@ func transformFunctionDeclaration(fn *ast.JSFunction) (*goast.FuncDecl, error) {
 
 	body, err := transformBlockStatement(fn.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to transform function body: %w", err)
 	}
+
+	// Analyze the function body to determine the return type
+	returnType := inferReturnType(body)
 
 	return &goast.FuncDecl{
 		Name: goast.NewIdent(fn.Name.Name),
 		Type: &goast.FuncType{
-			Params: params,
-			Results: &goast.FieldList{
-				List: []*goast.Field{{Type: goast.NewIdent("interface{}")}},
-			},
+			Params:  params,
+			Results: &goast.FieldList{List: []*goast.Field{{Type: returnType}}},
 		},
 		Body: body,
+	}, nil
+}
+
+func inferReturnType(body *goast.BlockStmt) goast.Expr {
+	// This is a simplified version. In a real implementation, you'd need to
+	// analyze all possible return statements and their types.
+	for _, stmt := range body.List {
+		if returnStmt, ok := stmt.(*goast.ReturnStmt); ok {
+			if len(returnStmt.Results) > 0 {
+				return inferTypeFromExpression(returnStmt.Results[0])
+			}
+		}
+	}
+	return goast.NewIdent("interface{}")
+}
+
+func transformForInOfStatement(stmt *ast.JSForInOfStatement) (goast.Stmt, error) {
+	var key, value *goast.Ident
+	var rangeExpr goast.Expr
+	var err error
+
+	if stmt.Left.(*ast.JSVariableDeclaration).Kind == "var" {
+		key = goast.NewIdent(stmt.Left.(*ast.JSVariableDeclaration).Declarations[0].ID.Name)
+	} else {
+		return nil, fmt.Errorf("unsupported left-hand side in for...in/of loop")
+	}
+
+	rangeExpr, err = transformExpression(stmt.Right)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform range expression: %w", err)
+	}
+
+	body, err := transformBlockStatement(stmt.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform loop body: %w", err)
+	}
+
+	if stmt.Type == "ForInStatement" {
+		// For...in iterates over object properties
+		value = goast.NewIdent("_") // We don't use the value in a for...in loop
+	} else if stmt.Type == "ForOfStatement" {
+		// For...of iterates over iterable values
+		value = key
+		key = goast.NewIdent("_") // We don't use the key in a for...of loop
+	} else {
+		return nil, fmt.Errorf("unknown for loop type: %s", stmt.Type)
+	}
+
+	return &goast.RangeStmt{
+		Key:   key,
+		Value: value,
+		Tok:   token.DEFINE,
+		X:     rangeExpr,
+		Body:  body,
 	}, nil
 }
 
@@ -666,9 +751,54 @@ func transformWhileStatement(stmt *ast.JSWhileStatement) (*goast.ForStmt, error)
 	}, nil
 }
 
-func transformDoWhileStatement(stmt *ast.JSDoWhileStatement) (*goast.ForStmt, error) {
-	// TODO: Implement do-while statement transformation
-	return nil, fmt.Errorf("do-while statement transformation not implemented")
+func transformDoWhileStatement(stmt *ast.JSDoWhileStatement) (*goast.BlockStmt, error) {
+	// Transform the loop body
+	body, err := transformBlockStatement(stmt.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform do-while body: %w", err)
+	}
+
+	// Transform the condition
+	condition, err := transformExpression(stmt.Test)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform do-while condition: %w", err)
+	}
+
+	// Create a label for the loop
+	loopLabel := goast.NewIdent("doWhileLoop")
+
+	// Create the loop structure
+	loopStmt := &goast.ForStmt{
+		Body: &goast.BlockStmt{
+			List: append(body.List,
+				&goast.IfStmt{
+					Cond: &goast.UnaryExpr{
+						Op: token.NOT,
+						X:  condition,
+					},
+					Body: &goast.BlockStmt{
+						List: []goast.Stmt{
+							&goast.BranchStmt{
+								Tok:   token.BREAK,
+								Label: loopLabel,
+							},
+						},
+					},
+				},
+			),
+		},
+	}
+
+	// Wrap the loop in a labeled statement
+	labeledStmt := &goast.LabeledStmt{
+		Label: loopLabel,
+		Stmt:  loopStmt,
+	}
+
+	// Return a block containing the labeled loop statement
+	return &goast.BlockStmt{
+		List: []goast.Stmt{labeledStmt},
+	}, nil
 }
 
 func transformReturnStatement(stmt *ast.JSReturnStatement) (*goast.ReturnStmt, error) {
@@ -733,19 +863,110 @@ func transformSwitchCase(c *ast.JSSwitchCase) (*goast.CaseClause, error) {
 }
 
 func transformTryStatement(stmt *ast.JSTryStatement) (*goast.BlockStmt, error) {
-	// TODO
-	return nil, nil
+	tryBlock, err := transformBlockStatement(stmt.Block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform try block: %w", err)
+	}
+
+	var catchBlock *goast.BlockStmt
+	if stmt.Handler != nil {
+		catchBlock, err = transformCatchClause(stmt.Handler)
+		if err != nil {
+			return nil, fmt.Errorf("failed to transform catch clause: %w", err)
+		}
+	}
+
+	var finallyBlock *goast.BlockStmt
+	if stmt.Finalizer != nil {
+		finallyBlock, err = transformBlockStatement(stmt.Finalizer)
+		if err != nil {
+			return nil, fmt.Errorf("failed to transform finally block: %w", err)
+		}
+	}
+
+	// Construct a Go-equivalent try-catch-finally using defer and panic
+	stmts := []goast.Stmt{
+		&goast.DeferStmt{
+			Call: &goast.CallExpr{
+				Fun: goast.NewIdent("func"),
+				Args: []goast.Expr{
+					&goast.FuncLit{
+						Type: &goast.FuncType{},
+						Body: &goast.BlockStmt{
+							List: []goast.Stmt{
+								&goast.IfStmt{
+									Cond: &goast.BinaryExpr{
+										X:  goast.NewIdent("r"),
+										Op: token.NEQ,
+										Y:  goast.NewIdent("nil"),
+									},
+									Body: catchBlock,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if finallyBlock != nil {
+		stmts = append(stmts, &goast.DeferStmt{
+			Call: &goast.CallExpr{
+				Fun: &goast.FuncLit{
+					Type: &goast.FuncType{},
+					Body: finallyBlock,
+				},
+			},
+		})
+	}
+
+	stmts = append(stmts, tryBlock.List...)
+
+	return &goast.BlockStmt{List: stmts}, nil
 }
 
-func transformClassDeclaration(decl *ast.JSClassDeclaration) (*goast.TypeSpec, error) {
+func transformCatchClause(clause *ast.JSCatchClause) (*goast.BlockStmt, error) {
+	body, err := transformBlockStatement(clause.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform catch body: %w", err)
+	}
+
+	// Add a type assertion to convert the recovered value to the expected type
+	typeAssert := &goast.AssignStmt{
+		Lhs: []goast.Expr{goast.NewIdent(clause.Param.Name)},
+		Tok: token.DEFINE,
+		Rhs: []goast.Expr{
+			&goast.TypeAssertExpr{
+				X:    goast.NewIdent("r"),
+				Type: goast.NewIdent("error"),
+			},
+		},
+	}
+
+	body.List = append([]goast.Stmt{typeAssert}, body.List...)
+
+	return body, nil
+}
+
+func transformClassDeclaration(decl *ast.JSClassDeclaration) ([]goast.Decl, error) {
 	structType := &goast.StructType{
 		Fields: &goast.FieldList{},
 	}
 
-	var methods []*goast.FuncDecl
+	var decls []goast.Decl
 
-	for _, method := range decl.Body.Body {
-		field, funcDecl, err := transformMethodDefinition(&method)
+	// Handle superclass if present
+	if decl.SuperClass != nil {
+		superField := &goast.Field{
+			Names: []*goast.Ident{goast.NewIdent(decl.SuperClass.Name)},
+			Type:  goast.NewIdent(decl.SuperClass.Name),
+		}
+		structType.Fields.List = append(structType.Fields.List, superField)
+	}
+
+	for _, member := range decl.Body.Body {
+		field, funcDecl, err := transformMethodDefinition(decl.ID.Name, member)
 		if err != nil {
 			return nil, err
 		}
@@ -755,7 +976,7 @@ func transformClassDeclaration(decl *ast.JSClassDeclaration) (*goast.TypeSpec, e
 		}
 
 		if funcDecl != nil {
-			methods = append(methods, funcDecl)
+			decls = append(decls, funcDecl)
 		}
 	}
 
@@ -765,20 +986,109 @@ func transformClassDeclaration(decl *ast.JSClassDeclaration) (*goast.TypeSpec, e
 		Type: structType,
 	}
 
-	// Add methods to the AST (they will be outside the struct definition)
-	// This part is not returned directly, but should be added to the file's declarations
-	for _ = range methods {
-		// Add method to file declarations
-	}
+	// Add the type declaration to the decls slice
+	decls = append([]goast.Decl{
+		&goast.GenDecl{
+			Tok:   token.TYPE,
+			Specs: []goast.Spec{typeSpec},
+		},
+	}, decls...)
 
-	return typeSpec, nil
+	return decls, nil
 }
 
-func transformMethodDefinition(method *ast.JSMethodDefinition) (*goast.Field, *goast.FuncDecl, error) {
-	// Transform method to either a struct field or a method declaration
-	// Return appropriate Go AST nodes
-	// This is a simplified implementation and may need to be expanded
-	return nil, nil, nil
+func transformMethodDefinition(className string, method ast.JSMethodDefinition) (*goast.Field, *goast.FuncDecl, error) {
+	switch method.Kind {
+	case "method":
+		return transformMethod(className, method)
+	case "constructor":
+		return transformConstructor(className, method)
+	case "get", "set":
+		return transformAccessor(className, method)
+	default:
+		return nil, nil, fmt.Errorf("unsupported method kind: %s", method.Kind)
+	}
+}
+
+func transformMethod(className string, method ast.JSMethodDefinition) (*goast.Field, *goast.FuncDecl, error) {
+	funcName := method.Key.(*ast.Identifier).Name
+	params, body, err := transformFunctionBody(method.Value)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	receiver := &goast.Field{
+		Names: []*goast.Ident{goast.NewIdent("self")},
+		Type:  goast.NewIdent(className),
+	}
+
+	funcDecl := &goast.FuncDecl{
+		Recv: &goast.FieldList{List: []*goast.Field{receiver}},
+		Name: goast.NewIdent(funcName),
+		Type: &goast.FuncType{
+			Params:  params,
+			Results: &goast.FieldList{}, // Adjust if you want to infer return types
+		},
+		Body: body,
+	}
+
+	return nil, funcDecl, nil
+}
+
+func transformConstructor(className string, method ast.JSMethodDefinition) (*goast.Field, *goast.FuncDecl, error) {
+	params, body, err := transformFunctionBody(method.Value)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	funcDecl := &goast.FuncDecl{
+		Name: goast.NewIdent("New" + className),
+		Type: &goast.FuncType{
+			Params: params,
+			Results: &goast.FieldList{
+				List: []*goast.Field{
+					{Type: &goast.StarExpr{X: goast.NewIdent(className)}},
+				},
+			},
+		},
+		Body: body,
+	}
+
+	// Add a return statement at the end of the constructor
+	returnStmt := &goast.ReturnStmt{
+		Results: []goast.Expr{
+			&goast.UnaryExpr{
+				Op: token.AND,
+				X:  goast.NewIdent(className + "{}"),
+			},
+		},
+	}
+	funcDecl.Body.List = append(funcDecl.Body.List, returnStmt)
+
+	return nil, funcDecl, nil
+}
+
+func transformAccessor(className string, method ast.JSMethodDefinition) (*goast.Field, *goast.FuncDecl, error) {
+	// For simplicity, we'll transform getters and setters to regular methods
+	// You might want to adjust this based on your specific needs
+	return transformMethod(className, method)
+}
+
+func transformFunctionBody(fn *ast.JSFunction) (*goast.FieldList, *goast.BlockStmt, error) {
+	params := &goast.FieldList{}
+	for _, param := range fn.Parameters {
+		params.List = append(params.List, &goast.Field{
+			Names: []*goast.Ident{goast.NewIdent(param.Name)},
+			Type:  goast.NewIdent("interface{}"), // You might want to infer types if possible
+		})
+	}
+
+	body, err := transformBlockStatement(fn.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return params, body, nil
 }
 
 func transformVariableDeclarationStmt(decl *ast.JSVariableDeclaration) (goast.Stmt, error) {

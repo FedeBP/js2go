@@ -136,6 +136,13 @@ func (p *Parser) parseStatement() ast.Statement {
 		case "if":
 			return p.parseIfStatement()
 		case "for":
+			if p.peekTokenIs(TokenPunctuation, "(") && (p.peekNthTokenIs(2, TokenKeyword, "in") || p.peekNthTokenIs(2, TokenKeyword, "of")) {
+				forStmt, err := p.parseForInOfStatement()
+				if err != nil {
+					panic("Failed to parse For (In/Of) statement")
+				}
+				return forStmt
+			}
 			return p.parseForStatement()
 		case "while":
 			return p.parseWhileStatement()
@@ -1050,20 +1057,70 @@ func (p *Parser) parseSpreadElement() ast.Expression {
 	}
 }
 
-func statementToExpression(stmt ast.Statement) ast.Expression {
-	switch s := stmt.(type) {
-	case ast.Expression:
-		return s
-	case *ast.ExpressionStatement:
-		return s.Expression
-	case *ast.JSVariableDeclaration:
-		// For a variable declaration, we'll return the first declarator's init expression
-		// This is a simplification and might not be appropriate for all use cases
-		if len(s.Declarations) > 0 && s.Declarations[0].Init != nil {
-			return s.Declarations[0].Init
-		}
+func (p *Parser) parseForInOfStatement() (*ast.JSForInOfStatement, error) {
+	stmt := &ast.JSForInOfStatement{}
+
+	p.nextToken() // Move past 'for'
+
+	if !p.expectPeek(TokenPunctuation, "(") {
+		return nil, fmt.Errorf("expected '(' after 'for'")
 	}
-	return nil // or handle this case as appropriate for your use case
+
+	// Parse the left part (can be a variable declaration or an expression)
+	if p.peekTokenIs(TokenKeyword, "var") || p.peekTokenIs(TokenKeyword, "let") || p.peekTokenIs(TokenKeyword, "const") {
+		stmt.Left = p.parseVariableDeclaration()
+	} else {
+		stmt.Left = p.parseExpression(LOWEST)
+	}
+
+	// Determine if it's a for...in or for...of loop
+	if p.expectPeek(TokenKeyword, "in") {
+		stmt.Type = "ForInStatement"
+	} else if p.expectPeek(TokenKeyword, "of") {
+		stmt.Type = "ForOfStatement"
+	} else {
+		return nil, fmt.Errorf("expected 'in' or 'of' in for loop")
+	}
+
+	// Parse the right part (the object or iterable)
+	p.nextToken()
+	stmt.Right = p.parseExpression(LOWEST)
+
+	if !p.expectPeek(TokenPunctuation, ")") {
+		return nil, fmt.Errorf("expected ')' after for...in/of expression")
+	}
+
+	// Parse the body
+	if !p.expectPeek(TokenPunctuation, "{") {
+		return nil, fmt.Errorf("expected '{' to start for loop body")
+	}
+
+	stmt.Body = p.parseBlockStatement()
+
+	return stmt, nil
+}
+
+func (p *Parser) peekNthTokenIs(n int, tokenType TokenType, value string) bool {
+	if n < 1 {
+		return false
+	}
+
+	// Store current position
+	curPos := p.l.pos
+
+	// Move to the nth token
+	for i := 0; i < n-1; i++ {
+		p.l.NextToken()
+	}
+
+	// Check the nth token
+	nthToken := p.l.NextToken()
+	isMatch := nthToken.Type == tokenType && (value == "" || nthToken.Value == value)
+
+	// Reset the lexer position
+	p.l.pos = curPos
+
+	return isMatch
 }
 
 func (p *Parser) Errors() []string {
