@@ -2,59 +2,41 @@ package main
 
 import (
 	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"reflect"
-
 	"github.com/FedeBP/js2go/internal/generator"
 	"github.com/FedeBP/js2go/internal/parser"
-	"github.com/FedeBP/js2go/internal/transformer"
+	"log"
+	"os"
+	"reflect"
 )
 
 func main() {
-	// Hardcode the input file path for debugging
-	inputFile := "examples/simple.js"
-
-	// Get the absolute path
-	absInputFile, err := filepath.Abs(inputFile)
-	if err != nil {
-		log.Fatalf("Error getting absolute path: %v", err)
-	}
-
-	// Read JavaScript file
-	jsCode, err := os.ReadFile(absInputFile)
+	// Read the simple.js file
+	jsCode, err := os.ReadFile("examples/simple.js")
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
 	}
 
-	// Parse JavaScript to AST
-	jsAST, err := parser.ParseJavaScript(string(jsCode))
+	// Parse the JavaScript code
+	p := parser.New(parser.NewLexer(string(jsCode)))
+	jsAst := p.ParseProgram()
+
+	// Create a new generator
+	newGenerator := generator.NewGenerator()
+
+	// Generate Go AST
+	goAst, err := newGenerator.GenerateGoAST(jsAst)
 	if err != nil {
-		log.Fatalf("Error parsing JavaScript: %v", err)
-	}
-	fmt.Println("=== JavaScript AST ===")
-	for i, node := range jsAST {
-		debugPrintAST(fmt.Sprintf("Node[%d]", i), node, "")
+		log.Fatalf("Error generating Go AST: %v", err)
 	}
 
-	// Transform JavaScript AST to Go AST
-	goAST, err := transformer.TransformAST(jsAST)
-	if err != nil {
-		log.Fatalf("Error transforming AST: %v", err)
-	}
-	fmt.Println("\n=== Go AST ===")
-	for i, node := range goAST {
-		debugPrintAST(fmt.Sprintf("Node[%d]", i), node, "")
-	}
-
-	// Generate Go code from Go AST
-	goCode, err := generator.GenerateGoCode(goAST)
+	// Generate Go code
+	goCode, err := newGenerator.GenerateGoCode(goAst)
 	if err != nil {
 		log.Fatalf("Error generating Go code: %v", err)
 	}
 
 	// Print the generated Go code
+	fmt.Println("Generated Go code:")
 	fmt.Println(goCode)
 }
 
