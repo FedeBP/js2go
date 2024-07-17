@@ -4,24 +4,22 @@ import (
 	"bytes"
 	"go/printer"
 	"go/token"
+	"strings"
 
-	goast "go/ast"
+	"go/ast"
 )
 
-// Generator holds the state for Go code generation
 type Generator struct {
 	fset *token.FileSet
 }
 
-// NewGenerator creates a new Generator
 func NewGenerator() *Generator {
 	return &Generator{
 		fset: token.NewFileSet(),
 	}
 }
 
-// GenerateGoCode generates Go code from a Go AST
-func (g *Generator) GenerateGoCode(file *goast.File) (string, error) {
+func (g *Generator) GenerateGoCode(file *ast.File) (string, error) {
 	var buf bytes.Buffer
 
 	err := printer.Fprint(&buf, g.fset, file)
@@ -29,5 +27,12 @@ func (g *Generator) GenerateGoCode(file *goast.File) (string, error) {
 		return "", err
 	}
 
-	return buf.String(), nil
+	// Remove the package declaration
+	code := buf.String()
+	lines := strings.Split(code, "\n")
+	if len(lines) > 0 && strings.HasPrefix(lines[0], "package ") {
+		code = strings.Join(lines[1:], "\n")
+	}
+
+	return strings.TrimSpace(code), nil
 }

@@ -17,6 +17,7 @@ type Parser struct {
 
 	prefixParseFns map[TokenType]prefixParseFn
 	infixParseFns  map[TokenType]infixParseFn
+	depth          int
 }
 
 type (
@@ -76,17 +77,12 @@ func New(l *Lexer) *Parser {
 	p.registerPrefix(TokenBooleanLiteral, p.parseBooleanLiteral)
 	p.registerPrefix(TokenNullLiteral, p.parseNullLiteral)
 	p.registerPrefix(TokenOperator, p.parsePrefixExpression)
-	p.registerPrefix(TokenPunctuation, p.parseGroupedExpression)
-	p.registerPrefix(TokenKeyword, p.parseFunctionLiteral)
-	p.registerPrefix(TokenPunctuation, p.parseArrayLiteral)
-	p.registerPrefix(TokenPunctuation, p.parseObjectLiteral)
-	p.registerPrefix(TokenKeyword, p.parseNewExpression)
-	p.registerPrefix(TokenPunctuation, p.parseSpreadElement)
+	p.registerPrefix(TokenPunctuation, p.parsePunctuation)
+	p.registerPrefix(TokenKeyword, p.parseKeyword)
 
 	// Register infix parse functions
 	p.registerInfix(TokenOperator, p.parseInfixExpression)
-	p.registerInfix(TokenPunctuation, p.parseCallExpression)
-	p.registerInfix(TokenPunctuation, p.parseIndexExpression)
+	p.registerInfix(TokenPunctuation, p.parseInfixPunctuation)
 
 	// Read two tokens, so curToken and peekToken are both set
 	p.nextToken()
@@ -106,40 +102,70 @@ func (p *Parser) registerInfix(tokenType TokenType, fn infixParseFn) {
 func (p *Parser) nextToken() {
 	p.curToken = p.peekToken
 	p.peekToken = p.l.NextToken()
+
+	// If we've reached the end of the file, set both current and peek tokens to EOF
+	if p.peekToken.Type == TokenEOF {
+		p.curToken = Token{Type: TokenEOF, Value: ""}
+		p.peekToken = Token{Type: TokenEOF, Value: ""}
+	}
 }
 
 func (p *Parser) ParseProgram() *ast.Program {
 	program := &ast.Program{}
 	program.Statements = []ast.Statement{}
 
+	maxIterations := 1000
+	iterations := 0
+
 	for p.curToken.Type != TokenEOF {
+		iterations++
+		if iterations > maxIterations {
+			p.errors = append(p.errors, "Maximum number of iterations exceeded. Possible infinite loop detected.")
+			break
+		}
+
 		stmt := p.parseStatement()
 		if stmt != nil {
 			program.Statements = append(program.Statements, stmt)
 		}
-		p.nextToken()
+		if len(p.errors) > 0 {
+			break
+		}
+
+		if p.curToken.Type == TokenEOF {
+			break
+		}
 	}
 
 	return program
 }
 
 func (p *Parser) parseStatement() ast.Statement {
+	for p.curToken.Type == TokenPunctuation && p.curToken.Value == ";" {
+		p.nextToken() // Skip standalone semicolons
+	}
+
+	if p.curToken.Type == TokenEOF {
+		return nil
+	}
+
 	switch p.curToken.Type {
 	case TokenKeyword:
 		switch p.curToken.Value {
-		case "var", "let", "const":
-			return p.parseVariableDeclaration()
 		case "function":
 			return p.parseFunctionDeclaration()
 		case "return":
 			return p.parseReturnStatement()
+		case "let", "var", "const":
+			return p.parseVariableDeclaration()
 		case "if":
 			return p.parseIfStatement()
 		case "for":
 			if p.peekTokenIs(TokenPunctuation, "(") && (p.peekNthTokenIs(2, TokenKeyword, "in") || p.peekNthTokenIs(2, TokenKeyword, "of")) {
 				forStmt, err := p.parseForInOfStatement()
 				if err != nil {
-					panic("Failed to parse For (In/Of) statement")
+					p.errors = append(p.errors, err.Error())
+					return nil
 				}
 				return forStmt
 			}
@@ -154,61 +180,56 @@ func (p *Parser) parseStatement() ast.Statement {
 			return p.parseTryStatement()
 		case "class":
 			return p.parseClassDeclaration()
+		default:
+			return p.parseExpressionStatement()
+		}
+	case TokenIdentifier:
+		if p.peekTokenIs(TokenPunctuation, "(") {
+			return p.parseExpressionStatement()
 		}
 	default:
-		return p.parseExpressionStatement()
+		panic("unhandled default case")
 	}
+
 	return p.parseExpressionStatement()
 }
 
-func (p *Parser) parseVariableDeclaration() *ast.JSVariableDeclaration {
+func (p *Parser) parseVariableDeclaration() ast.Statement {
 	decl := &ast.JSVariableDeclaration{
-		Kind: p.curToken.Value, // "var", "let", or "const"
+		Kind: p.curToken.Value,
 	}
 
-	p.nextToken() // move past var/let/const
-
-	for {
-		if p.curToken.Type != TokenIdentifier {
-			p.errors = append(p.errors, fmt.Sprintf("Expected identifier, got %s", p.curToken.Value))
-			return nil
-		}
-
-		declarator := &ast.JSVariableDeclarator{
-			ID: &ast.Identifier{Name: p.curToken.Value},
-		}
-
-		p.nextToken() // move past identifier
-
-		// Check for initializer
-		if p.curToken.Type == TokenOperator && p.curToken.Value == "=" {
-			p.nextToken() // move past '='
-
-			init := p.parseExpression(LOWEST)
-			if init == nil {
-				return nil
-			}
-			declarator.Init = init
-		}
-
-		decl.Declarations = append(decl.Declarations, declarator)
-
-		// If the next token is a comma, we have more variables to parse
-		if p.curToken.Type == TokenPunctuation && p.curToken.Value == "," {
-			p.nextToken() // move past comma
-			continue
-		}
-
-		// If we're here, we should be at a semicolon or end of statement
-		break
+	if !p.expectPeek(TokenIdentifier, "") {
+		return nil
 	}
 
-	// Optionally consume semicolon
-	if p.curToken.Type == TokenPunctuation && p.curToken.Value == ";" {
+	variable := &ast.JSVariableDeclarator{
+		ID: &ast.Identifier{Name: p.curToken.Value},
+	}
+
+	if p.peekTokenIs(TokenOperator, "=") {
+		p.nextToken() // Consume the '='
+		p.nextToken() // Move to the value
+		variable.Init = p.parseExpression(LOWEST)
+	}
+
+	decl.Declarations = append(decl.Declarations, variable)
+
+	if p.peekTokenIs(TokenPunctuation, ";") {
 		p.nextToken()
 	}
 
 	return decl
+}
+
+func (p *Parser) parseExpressionStatement() *ast.ExpressionStatement {
+	stmt := &ast.ExpressionStatement{Expression: p.parseExpression(LOWEST)}
+
+	if p.peekTokenIs(TokenPunctuation, ";") {
+		p.nextToken()
+	}
+
+	return stmt
 }
 
 func (p *Parser) parseExpression(precedence int) ast.Expression {
@@ -219,7 +240,7 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 	}
 	leftExp := prefix()
 
-	for !p.peekTokenIs(TokenPunctuation, ";") && precedence < p.peekPrecedence() {
+	for !p.peekTokenIs(TokenPunctuation, ";") && !p.peekTokenIs(TokenPunctuation, "}") && precedence < p.peekPrecedence() {
 		infix := p.infixParseFns[p.peekToken.Type]
 		if infix == nil {
 			return leftExp
@@ -229,6 +250,8 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 
 		if p.curTokenIs(TokenPunctuation, "?") {
 			leftExp = p.parseConditionalExpression(leftExp)
+		} else if p.curTokenIs(TokenPunctuation, "(") {
+			leftExp = p.parseCallExpression(leftExp)
 		} else {
 			leftExp = infix(leftExp)
 		}
@@ -272,6 +295,48 @@ func (p *Parser) parsePrefixExpression() ast.Expression {
 	expression.Argument = p.parseExpression(PREFIX)
 
 	return expression
+}
+
+func (p *Parser) parsePunctuation() ast.Expression {
+	switch p.curToken.Value {
+	case "(":
+		return p.parseGroupedExpression()
+	case "[":
+		return p.parseArrayLiteral()
+	case "{":
+		return p.parseObjectLiteral()
+	case "...":
+		return p.parseSpreadElement()
+	default:
+		p.errors = append(p.errors, fmt.Sprintf("Unexpected punctuation: %s", p.curToken.Value))
+		return nil
+	}
+}
+
+func (p *Parser) parseInfixPunctuation(left ast.Expression) ast.Expression {
+	switch p.curToken.Value {
+	case "(":
+		return p.parseCallExpression(left)
+	case "[":
+		return p.parseIndexExpression(left)
+	case ".":
+		return p.parseMemberExpression(left)
+	default:
+		p.errors = append(p.errors, fmt.Sprintf("Unexpected infix punctuation: %s", p.curToken.Value))
+		return nil
+	}
+}
+
+func (p *Parser) parseKeyword() ast.Expression {
+	switch p.curToken.Value {
+	case "function":
+		return p.parseFunctionLiteral()
+	case "new":
+		return p.parseNewExpression()
+	default:
+		p.errors = append(p.errors, fmt.Sprintf("Unexpected keyword: %s", p.curToken.Value))
+		return nil
+	}
 }
 
 func (p *Parser) parseInfixExpression(left ast.Expression) ast.Expression {
@@ -400,6 +465,13 @@ func (p *Parser) parseBlockStatement() *ast.BlockStatement {
 		}
 		p.nextToken()
 	}
+
+	// Consume the closing '}'
+	if !p.curTokenIs(TokenPunctuation, "}") {
+		p.errors = append(p.errors, "Expected '}' at end of block")
+		return nil
+	}
+	p.nextToken() // Move past the closing '}'
 
 	return block
 }
@@ -575,15 +647,10 @@ func (p *Parser) parseReturnStatement() *ast.JSReturnStatement {
 	// Check if there's an expression after 'return'
 	if !p.curTokenIs(TokenPunctuation, ";") && !p.curTokenIs(TokenPunctuation, "}") {
 		stmt.Value = p.parseExpression(LOWEST)
-
-		// Parse until we reach a semicolon or the end of the line
-		for !p.curTokenIs(TokenPunctuation, ";") && !p.curTokenIs(TokenPunctuation, "}") && !p.curTokenIs(TokenEOF, "") {
-			p.nextToken()
-		}
 	}
 
 	// Consume the semicolon if it's there
-	if p.curTokenIs(TokenPunctuation, ";") {
+	if p.peekTokenIs(TokenPunctuation, ";") {
 		p.nextToken()
 	}
 
@@ -985,20 +1052,6 @@ func (p *Parser) parseMethod() *ast.JSFunction {
 	return function
 }
 
-func (p *Parser) parseExpressionStatement() *ast.ExpressionStatement {
-	stmt := &ast.ExpressionStatement{}
-
-	stmt.Expression = p.parseExpression(LOWEST)
-
-	// In JavaScript, semicolons are optional in many cases
-	// So we'll consume it if it's there, but won't require it
-	if p.peekTokenIs(TokenPunctuation, ";") {
-		p.nextToken()
-	}
-
-	return stmt
-}
-
 func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
 	exp := &ast.JSMemberExpression{
 		Object:   left,
@@ -1016,11 +1069,10 @@ func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
 	return exp
 }
 
-func (p *Parser) parseConditionalExpression(left ast.Expression) ast.Expression {
-	expression := &ast.JSConditionalExpression{Test: left}
+func (p *Parser) parseConditionalExpression(condition ast.Expression) ast.Expression {
+	expression := &ast.JSConditionalExpression{Test: condition}
 
 	p.nextToken() // Consume the '?'
-
 	expression.Consequent = p.parseExpression(LOWEST)
 
 	if !p.expectPeek(TokenPunctuation, ":") {
@@ -1028,7 +1080,6 @@ func (p *Parser) parseConditionalExpression(left ast.Expression) ast.Expression 
 	}
 
 	p.nextToken() // Consume the ':'
-
 	expression.Alternate = p.parseExpression(LOWEST)
 
 	return expression
@@ -1051,6 +1102,14 @@ func (p *Parser) parseNewExpression() ast.Expression {
 
 func (p *Parser) parseSpreadElement() ast.Expression {
 	p.nextToken() // Consume '...'
+
+	// Add a depth check to prevent infinite recursion
+	if p.depth > 1000 {
+		p.errors = append(p.errors, "Maximum depth exceeded in parseSpreadElement")
+		return nil
+	}
+	p.depth++
+	defer func() { p.depth-- }()
 
 	return &ast.JSSpreadElement{
 		Argument: p.parseExpression(LOWEST),

@@ -46,6 +46,15 @@ func (l *Lexer) NextToken() Token {
 	r := l.next()
 
 	switch {
+	case r == ';':
+		// Skip all consecutive semicolons
+		for l.peekIs(';') {
+			l.next()
+		}
+		if l.pos >= len(l.input) {
+			return Token{Type: TokenEOF}
+		}
+		return Token{Type: TokenPunctuation, Value: ";"}
 	case isLetter(r):
 		return l.lexIdentifierOrKeyword()
 	case isDigit(r):

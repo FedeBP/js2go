@@ -12,32 +12,39 @@ import (
 )
 
 func main() {
-	// Read the JavaScript file
 	jsCode, err := os.ReadFile("examples/simple.js")
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
 	}
 
-	// Parse the JavaScript code
 	p := parser.New(parser.NewLexer(string(jsCode)))
 	jsAst := p.ParseProgram()
 
-	// Transform the JavaScript AST to a Go AST
-	goAst, err := transformer.Transform(jsAst)
+	if len(p.Errors()) > 0 {
+		log.Fatalf("Parsing errors: %v", p.Errors())
+	}
+
+	//fmt.Println("JavaScript AST:")
+	//debugPrintAST("Program", jsAst, "")
+
+	trans := transformer.NewTransformer()
+
+	goAst, err := trans.Transform(jsAst)
 	if err != nil {
 		log.Fatalf("Error transforming AST: %v", err)
 	}
 
-	// Create a new generator
-	newGenerator := generator.NewGenerator()
+	//fmt.Println("\nGo AST:")
+	//debugPrintAST("File", goAst, "")
 
-	// Generate Go code from the Go AST
-	goCode, err := newGenerator.GenerateGoCode(goAst)
+	gen := generator.NewGenerator()
+
+	goCode, err := gen.GenerateGoCode(goAst)
 	if err != nil {
 		log.Fatalf("Error generating Go code: %v", err)
 	}
 
-	// Print or save the generated Go code
+	fmt.Println("\nGenerated Go Code:")
 	fmt.Println(goCode)
 }
 
